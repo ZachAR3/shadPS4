@@ -154,6 +154,8 @@ private:
 
     void ReleaseUnmappedMemory();
 
+    void EvictIdleMemory();
+
     void FreeReleasedMemory();
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
@@ -196,8 +198,21 @@ private:
             return {{a, b}, memory, offset + (a - start)};
         }
     };
+    struct BackingInfo {
+        u64 blocks;
+        u64 last_use;
+    };
     IntervalList<Backing> resident_ranges;
-    std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+
+    void ReleaseResidency(const IntervalList<Backing>& release_ranges, bool still_mapped);
+
+    std::unordered_map<VkDeviceMemory, BackingInfo> backing_blocks;
+    u64 frame_tick{};
+    u64 dma_tick{};
+    u64 evict_pressure_memory{};
+    u64 evict_critical_memory{};
+    u64 evict_target_memory{};
+
     std::deque<std::pair<u64, std::vector<vk::DeviceMemory>>> released_memory;
     u64 unbind_tick{};
     std::mutex unmap_mutex;

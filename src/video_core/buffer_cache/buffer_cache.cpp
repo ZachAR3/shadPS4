@@ -110,6 +110,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
         runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
     }
+
+    const u64 memory_budget = instance.GetTotalMemoryBudget();
+    evict_target_memory = memory_budget * 6 / 10;
+    evict_pressure_memory = memory_budget * 7 / 10;
+    evict_critical_memory = memory_budget * 85 / 100;
 }
 
 BufferCache::~BufferCache() = default;
@@ -118,8 +123,10 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+    ++frame_tick;
     FreeReleasedMemory();
     ReleaseUnmappedMemory();
+    EvictIdleMemory();
 }
 
 void BufferCache::MapMemory(VAddr device_addr, u64 size) {
@@ -149,7 +156,80 @@ void BufferCache::ReleaseUnmappedMemory() {
     if (release_ranges.Empty()) {
         return;
     }
+    ReleaseResidency(release_ranges, false);
+}
 
+void BufferCache::EvictIdleMemory() {
+    static constexpr u64 EVICT_INTERVAL_TICKS = 16;
+    static constexpr u64 PRESSURE_MIN_IDLE_TICKS = 120;
+    static constexpr u64 CRITICAL_MIN_IDLE_TICKS = 16;
+    if (frame_tick % EVICT_INTERVAL_TICKS != 0 || backing_blocks.empty() ||
+        !released_memory.empty() || !instance.CanReportMemoryUsage()) {
+        return;
+    }
+    const u64 used_memory = instance.GetDeviceMemoryUsage();
+    if (used_memory < evict_pressure_memory) {
+        return;
+    }
+    const u64 min_idle =
+        used_memory >= evict_critical_memory ? CRITICAL_MIN_IDLE_TICKS : PRESSURE_MIN_IDLE_TICKS;
+    // Shaders using DMA can read any resident memory without it being requested.
+    if (frame_tick - dma_tick < min_idle) {
+        return;
+    }
+
+    std::unordered_map<VkDeviceMemory, boost::container::small_vector<Backing, 4>> candidates;
+    for (const auto& [memory, info] : backing_blocks) {
+        if (frame_tick - info.last_use >= min_idle) {
+            candidates.try_emplace(memory);
+        }
+    }
+    if (candidates.empty()) {
+        return;
+    }
+    for (const Backing& range : resident_ranges) {
+        if (const auto it = candidates.find(range.memory); it != candidates.end()) {
+            it->second.push_back(range);
+        }
+    }
+    std::vector<std::pair<u64, VkDeviceMemory>> order;
+    order.reserve(candidates.size());
+    for (const auto& [memory, ranges] : candidates) {
+        order.emplace_back(backing_blocks[memory].last_use, memory);
+    }
+    std::ranges::sort(order);
+
+    IntervalList<Backing> release_ranges;
+    u64 freed_memory{};
+    for (const auto& [last_use, memory] : order) {
+        if (used_memory - freed_memory <= evict_target_memory) {
+            break;
+        }
+        const auto& ranges = candidates[memory];
+        // GPU modified memory may not have a copy in guest memory.
+        const bool gpu_modified = std::ranges::any_of(ranges, [&](const Backing& range) {
+            const VAddr device_addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            return memory_tracker->IsRegionGpuModified(device_addr, size) ||
+                   gpu_modified_ranges.Intersects(device_addr, size);
+        });
+        if (gpu_modified) {
+            continue;
+        }
+        for (const Backing& range : ranges) {
+            release_ranges.Add(range);
+        }
+        freed_memory += backing_blocks[memory].blocks << block_shift;
+    }
+    if (release_ranges.Empty()) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "Evicting {} MiB of idle buffer memory (device usage {} MiB)",
+             freed_memory >> 20, used_memory >> 20);
+    ReleaseResidency(release_ranges, true);
+}
+
+void BufferCache::ReleaseResidency(const IntervalList<Backing>& release_ranges, bool still_mapped) {
     std::vector<ArenaBinds> unbinds;
     std::vector<vk::DeviceMemory> freed_memory;
     for (const Backing& range : release_ranges) {
@@ -162,8 +242,8 @@ void BufferCache::ReleaseUnmappedMemory() {
         });
 
         const auto backing_it = backing_blocks.find(range.memory);
-        backing_it->second -= range.end - range.start;
-        if (backing_it->second == 0) {
+        backing_it->second.blocks -= range.end - range.start;
+        if (backing_it->second.blocks == 0) {
             freed_memory.push_back(range.memory);
             backing_blocks.erase(backing_it);
         }
@@ -171,8 +251,12 @@ void BufferCache::ReleaseUnmappedMemory() {
         resident_ranges.Subtract(range.start, range.end);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
-        gpu_modified_ranges.Subtract(device_addr, size);
+        if (still_mapped) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        } else {
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
         runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
                            (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
     }
@@ -433,6 +517,7 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
 
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
+    dma_tick = frame_tick;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -496,6 +581,9 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    resident_ranges.ForEachInRange(first_block, last_block + 1, [&](const Backing& backing) {
+        backing_blocks[backing.memory].last_use = frame_tick;
+    });
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -517,7 +605,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         .memoryTypeIndex = arena_memory_type_index,
     };
     const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
-    backing_blocks.emplace(device_memory, resident_blocks);
+    backing_blocks.emplace(device_memory, BackingInfo{resident_blocks, frame_tick});
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
