@@ -140,6 +140,23 @@ void Liverpool::Process(std::stop_token stoken) {
 
         VideoCore::StartCapture();
 
+        const auto process_frame_done = [this] {
+            const bool guest_done = submit_done;
+            if (!guest_done && !flip_done) {
+                return;
+            }
+            VideoCore::EndCapture();
+            if (rasterizer) {
+                rasterizer->OnSubmit();
+                rasterizer->Flush();
+            }
+            if (guest_done) {
+                submit_done = false;
+                submit_done_since_flip = true;
+            }
+            flip_done = false;
+        };
+
         curr_qid = -1;
 
         while ((num_submits || num_commands) && !stoken.stop_requested()) {
@@ -170,16 +187,11 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
             }
+
+            process_frame_done();
         }
 
-        if (submit_done) {
-            VideoCore::EndCapture();
-            if (rasterizer) {
-                rasterizer->OnSubmit();
-                rasterizer->Flush();
-            }
-            submit_done = false;
-        }
+        process_frame_done();
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -309,6 +321,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    flip_done = !std::exchange(submit_done_since_flip, false);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
